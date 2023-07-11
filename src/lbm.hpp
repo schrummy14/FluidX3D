@@ -6,6 +6,11 @@
 #include "units.hpp"
 #include "info.hpp"
 
+uint bytes_per_cell_host(); // returns the number of Bytes per cell allocated in host memory
+uint bytes_per_cell_device(); // returns the number of Bytes per cell allocated in device memory
+uint bandwidth_bytes_per_cell_device(); // returns the bandwidth in Bytes per cell per time step from/to device memory
+uint3 resolution(const float3 box_aspect_ratio, const uint memory); // input: simulation box aspect ratio and VRAM occupation in MB, output: grid resolution
+
 string default_filename(const string& path, const string& name, const string& extension, const ulong t); // generate a default filename with timestamp
 string default_filename(const string& name, const string& extension, const ulong t); // generate a default filename with timestamp at exe_path/export/
 
@@ -142,7 +147,8 @@ public:
 		Memory<float> camera_parameters; // contains camera position, rotation, field of view etc.
 
 		LBM_Domain* lbm = nullptr;
-		Kernel kernel_graphics_flags; // render flag lattice
+		Kernel kernel_graphics_flags; // render flag lattice with wireframe
+		Kernel kernel_graphics_flags_mc; // render flag lattice with marching-cubes
 		Kernel kernel_graphics_field; // render a colored velocity vector for each node
 		Kernel kernel_graphics_streamline; // render streamlines
 		Kernel kernel_graphics_q; // render vorticity (Q-criterion)
@@ -160,7 +166,7 @@ public:
 		Kernel kernel_graphics_particles;
 #endif // PARTICLES
 
-		ulong t_last_frame = 0ull; // optimization to not call draw_frame() multiple times if camera_parameters and LBM time step are unchanged
+		ulong t_last_rendered_frame = 0ull; // optimization to not call draw_frame() multiple times if camera_parameters and LBM time step are unchanged
 		bool update_camera(); // update camera_parameters and return if they are changed from their previous state
 
 	public:
@@ -179,7 +185,7 @@ public:
 			return *this;
 		}
 		void allocate(Device& device); // allocate memory for bitmap and zbuffer
-		void enqueue_draw_frame(); // main rendering function, calls rendering kernels
+		bool enqueue_draw_frame(const int visualization_modes, const int slice_mode=0, const int slice_x=0, const int slice_y=0, const int slice_z=0); // main rendering function, calls rendering kernels, returns true if new frame is rendered, false if old frame is returned when camera has not moved
 		int* get_bitmap(); // returns pointer to bitmap
 		int* get_zbuffer(); // returns pointer to zbuffer
 		string device_defines() const; // returns preprocessor constants for embedding in OpenCL C code
@@ -265,15 +271,15 @@ public:
 					data[i*(ulong)dimensions()+(ulong)d] = reverse_bytes(reference(i, d)); // SoA <- AoS
 				}
 			}
-			create_folder(path);
 			const string filename = create_file_extension(path, ".vtk");
+			create_folder(filename);
 			std::ofstream file(filename, std::ios::out|std::ios::binary);
 			file.write(header.c_str(), header.length()); // write non-binary file header
 			file.write((char*)data, capacity()); // write binary data
 			file.close();
 			delete[] data;
 			info.allow_rendering = false; // temporarily disable interactive rendering
-			print_info("File \""+path+"\" saved.");
+			print_info("File \""+filename+"\" saved.");
 			info.allow_rendering = true;
 		}
 
@@ -368,10 +374,14 @@ public:
 	Memory<float>* particles; // particle positions
 #endif // PARTICLES
 
-	LBM(const uint Nx, const uint Ny, const uint Nz, const float nu, const float fx=0.0f, const float fy=0.0f, const float fz=0.0f, const float sigma=0.0f, const float alpha=0.0f, const float beta=0.0f, const uint particles_N=0u, const float particles_rho=0.0f); // compiles OpenCL C code and allocates memory
 	LBM(const uint Nx, const uint Ny, const uint Nz, const uint Dx, const uint Dy, const uint Dz, const float nu, const float fx=0.0f, const float fy=0.0f, const float fz=0.0f, const float sigma=0.0f, const float alpha=0.0f, const float beta=0.0f, const uint particles_N=0u, const float particles_rho=0.0f); // compiles OpenCL C code and allocates memory
+	LBM(const uint Nx, const uint Ny, const uint Nz, const float nu, const float fx=0.0f, const float fy=0.0f, const float fz=0.0f, const float sigma=0.0f, const float alpha=0.0f, const float beta=0.0f, const uint particles_N=0u, const float particles_rho=1.0f); // compiles OpenCL C code and allocates memory
 	LBM(const uint Nx, const uint Ny, const uint Nz, const float nu, const uint particles_N, const float particles_rho=1.0f); // compiles OpenCL C code and allocates memory
 	LBM(const uint Nx, const uint Ny, const uint Nz, const float nu, const float fx, const float fy, const float fz, const uint particles_N, const float particles_rho=1.0f); // compiles OpenCL C code and allocates memory
+	LBM(const uint3 N, const uint Dx, const uint Dy, const uint Dz, const float nu, const float fx=0.0f, const float fy=0.0f, const float fz=0.0f, const float sigma=0.0f, const float alpha=0.0f, const float beta=0.0f, const uint particles_N=0u, const float particles_rho=0.0f); // compiles OpenCL C code and allocates memory
+	LBM(const uint3 N, const float nu, const float fx=0.0f, const float fy=0.0f, const float fz=0.0f, const float sigma=0.0f, const float alpha=0.0f, const float beta=0.0f, const uint particles_N=0u, const float particles_rho=1.0f); // compiles OpenCL C code and allocates memory
+	LBM(const uint3 N, const float nu, const uint particles_N, const float particles_rho=1.0f); // compiles OpenCL C code and allocates memory
+	LBM(const uint3 N, const float nu, const float fx, const float fy, const float fz, const uint particles_N, const float particles_rho=1.0f); // compiles OpenCL C code and allocates memory
 	~LBM();
 
 	void run(const ulong steps=max_ulong); // initializes the LBM simulation (copies data to device and runs initialize kernel), then runs LBM
@@ -473,6 +483,7 @@ public:
 
 	void voxelize_mesh_on_device(const Mesh* mesh, const uchar flag=TYPE_S, const float3& rotation_center=float3(0.0f), const float3& linear_velocity=float3(0.0f), const float3& rotational_velocity=float3(0.0f)); // voxelize mesh
 	void unvoxelize_mesh_on_device(const Mesh* mesh, const uchar flag=TYPE_S); // remove voxelized triangle mesh from LBM grid
+	void write_mesh_to_vtk(const Mesh* mesh, const string& path="") const; // write mesh to binary .vtk file
 	void voxelize_stl(const string& path, const float3& center, const float3x3& rotation, const float size=0.0f, const uchar flag=TYPE_S); // read and voxelize binary .stl file
 	void voxelize_stl(const string& path, const float3x3& rotation, const float size=0.0f, const uchar flag=TYPE_S); // read and voxelize binary .stl file (place in box center)
 	void voxelize_stl(const string& path, const float3& center, const float size=0.0f, const uchar flag=TYPE_S); // read and voxelize binary .stl file (no rotation)
@@ -483,18 +494,24 @@ public:
 	private:
 		LBM* lbm = nullptr;
 		std::atomic_int running_encoders = 0;
+		uint last_exported_frame = 0u; // for next_frame(...) function
 		void default_settings() {
-			key_1 = true;
+			visualization_modes |= VIS_FLAG_LATTICE;
 #ifdef PARTICLES
-			key_7 = true;
+			visualization_modes |= VIS_PARTICLES;
 #endif // PARTICLES
 		}
 
 	public:
+		int visualization_modes=0, slice_mode=0, slice_x=0, slice_y=0, slice_z=0; // slice visualization: mode = { 0 (no slice), 1 (x), 2 (y), 3 (z), 4 (xz), 5 (xyz), 6 (yz), 7 (xy) }, slice_{xyz} = position of slices
+
 		Graphics() {} // default constructor
 		Graphics(LBM* lbm) {
 			this->lbm = lbm;
 			camera.set_zoom(0.5f*(float)fmax(fmax(lbm->get_Nx(), lbm->get_Ny()), lbm->get_Nz()));
+			slice_x = (int)lbm->get_Nx()/2;
+			slice_y = (int)lbm->get_Ny()/2;
+			slice_z = (int)lbm->get_Nz()/2;
 			default_settings();
 		}
 		~Graphics() { // destructor must wait for all encoder threads to finish
@@ -510,6 +527,11 @@ public:
 		}
 		Graphics& operator=(const Graphics& graphics) { // copy assignment
 			lbm = graphics.lbm;
+			visualization_modes = graphics.visualization_modes;
+			slice_mode = graphics.slice_mode;
+			slice_x = graphics.slice_x;
+			slice_y = graphics.slice_y;
+			slice_z = graphics.slice_z;
 			return *this;
 		}
 
@@ -517,6 +539,7 @@ public:
 
 		void set_camera_centered(const float rx=0.0f, const float ry=0.0f, const float fov=100.0f, const float zoom=1.0f); // set camera centered
 		void set_camera_free(const float3& p=float3(0.0f), const float rx=0.0f, const float ry=0.0f, const float fov=100.0f); // set camera free
+		bool next_frame(const ulong total_time_steps, const float video_length_seconds); // returns true once simulation time has progressed enough to render the next video frame for a 60fps video of specified length
 		void print_frame(); // preview preview of current frame in console
 		void write_frame(const string& path="", const string& name="image", const string& extension=".png", bool print_preview=false); // save current frame
 		void write_frame(const uint x1, const uint y1, const uint x2, const uint y2, const string& path="", const string& name="image", const string& extension=".png", bool print_preview=false); // save current frame cropped with two corner points (x1,y1) and (x2,y2)
